@@ -29,3 +29,43 @@ pytest
 
 The two source datasets under `data/` are deliberately ignored by Git and are
 not read or changed during this phase.
+
+## Dataset preparation
+
+Phase 2 reads both immutable dataset exports using `finalLabel` only and writes
+derived manifests to `data/processed/`:
+
+```zsh
+source .venv/bin/activate
+python scripts/prepare_dataset.py --seed 1337
+```
+
+Formatting-only internal spaces are retained in `label` and emitted separately
+as `normalized_label`. The default `reviewed-only` policy admits only
+`manual-correction` and `ocr-reviewed` labels; use `--admission-policy
+manual-corrections-only` for a stricter derived split. The generated reports
+record validation issues, duplicate hashes, provenance, source-grouping limits,
+review examples, and split-leakage checks. The visually transcribed export
+remains audit/review-only until independently verified.
+
+## Grammar and model verification
+
+`sn_ml.grammar` validates the closed tonic sol-fa syntax without changing a
+prediction. `sn_ml.model` provides a compact CNN → bidirectional GRU → CTC
+network, and `sn_ml.preprocessing` converts original cell images into
+grayscale, aspect-ratio-preserving variable-width tensors. These components are
+implemented and tested only; no model training is started in this project phase.
+
+## Bounded smoke experiment
+
+Phase 5A adds resumable AdamW/CTC training and validation infrastructure. The
+following command runs only a small, two-epoch smoke experiment on train and
+validation manifests; it never reads the held-out test manifest:
+
+```zsh
+python scripts/run_smoke_training.py --train-limit 32 --validation-limit 16
+```
+
+It writes best/latest checkpoints under `checkpoints/phase5a_smoke/` and JSON
+metrics under `exports/phase5a_smoke_metrics.json`. A full training run still
+requires an explicit later-phase decision.

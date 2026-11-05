@@ -1,0 +1,40 @@
+{
+  "image": {
+    "height": 64,
+    "min_width": 16,
+    "max_width": 384,
+    "normalize_ink": true
+  },
+  "augmentation": {
+    "rotation_degrees": 1.5,
+    "brightness": 0.1,
+    "noise_std": 0.01
+  },
+  "model": {
+    "cnn_channels": [16, 32, 64],
+    "recurrent_hidden_size": 64,
+    "recurrent_layers": 1,
+    "dropout": 0.1,
+    "ctc_blank_index": 0,
+    "class_count": 18
+  },
+  "runtime": {
+    "device": "auto",
+    "batch_size": 8,
+    "decoding": "greedy_ctc"
+  },
+  "training": {
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "gradient_clip_norm": 1.0,
+    "early_stopping_patience": 3,
+    "seed": 1337
+  },
+  "full_training": {
+    "device": "mps",
+    "batch_size": 8,
+    "maximum_epochs": 50,
+    "early_stopping_patience": 7,
+    "checkpoint_selection": "validation_cer_then_exact_cell_accuracy"
+  }
+}
