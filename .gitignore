@@ -1,0 +1,29 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Original and generated dataset content is local-only.
+data/solfanote_dataset_labeled/
+data/solfanote-training/
+data/processed/
+
+# Generated ML artifacts.
+checkpoints/*
+!checkpoints/.gitkeep
+exports/*
+!exports/.gitkeep
+reports/
+runs/
+*.pt
+*.pth
+*.onnx
+
+# Local editor and operating-system files.
+.DS_Store
+.vscode/*.log
