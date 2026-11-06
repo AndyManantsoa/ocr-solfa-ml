@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from collections import Counter
 import json
 from pathlib import Path
 import random
@@ -17,11 +18,11 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Subset
 
 from sn_ml.dataset import OcrManifestDataset, collate_ocr_batch, load_manifest
-from sn_ml.evaluate import RecognitionMetrics, character_error_summary
-from sn_ml.grammar import validate_tonic_solfa
+from sn_ml.evaluate import RecognitionMetrics, alignment_errors, character_error_summary
+from sn_ml.grammar import CHROMATIC_NOTES, NATURAL_NOTES, validate_tonic_solfa
 from sn_ml.inference import greedy_decode
 from sn_ml.model import CRNNConfig, TonicSolfaCRNN, ctc_loss, select_device
-from sn_ml.preprocessing import PreprocessConfig
+from sn_ml.preprocessing import PreprocessConfig, pad_image_tensors, preprocess_image
 from sn_ml.vocabulary import VOCAB
 
 
@@ -289,3 +290,200 @@ def validation_diagnostics(
             diagnostics.append({"id": record_id, **character_error_summary(reference, prediction)})
             offset += length
     return diagnostics
+
+
+def _error_categories(reference: str, prediction: str) -> list[str]:
+    text = reference + prediction
+    categories = []
+    if "," in text or "'" in text:
+        categories.append("octave_marker")
+    if any(symbol in text for symbol in ".;-"):
+        categories.append("rhythmic_symbol")
+    if any(token in text for token in CHROMATIC_NOTES):
+        categories.append("chromatic_note")
+    if any(left == right for left, right in zip(text, text[1:])):
+        categories.append("repeated_character")
+    parsed = validate_tonic_solfa(reference)
+    if len(parsed.note_tokens) > 1 or sum(character in NATURAL_NOTES for character in reference) > 1:
+        categories.append("multiple_note_cell")
+    if reference == "" or prediction == "":
+        categories.append("blank_cell")
+    if ":" in text or "|" in text:
+        categories.append("visual_beat_separator")
+    return categories
+
+
+@torch.no_grad()
+def full_split_diagnostics(
+    project_root: Path,
+    checkpoint_path: Path,
+    *,
+    split_name: str,
+    device_name: str = "auto",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Evaluate every record in one existing manifest without changing it."""
+    if split_name not in {"val", "test"}:
+        raise ValueError("Full diagnostics supports only the fixed val or test manifest")
+    device = training_device(device_name)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    model = TonicSolfaCRNN(CRNNConfig(**checkpoint["model_config"])).to(device)
+    load_checkpoint(checkpoint_path, model, device=device)
+    loader = _manifest_loader(
+        project_root / f"data/processed/{split_name}.json", project_root, PreprocessConfig(),
+        TrainingConfig(batch_size=8, device=device_name), training=False, limit=None,
+    )
+    model.eval()
+    metrics = RecognitionMetrics()
+    category_counts: Counter[str] = Counter()
+    error_counts: Counter[str] = Counter()
+    records: list[dict[str, Any]] = []
+    for batch in loader:
+        moved = _move_batch(batch, device)
+        logits = model(moved["images"])
+        predictions = greedy_decode(logits, model.output_lengths(moved["widths"]))
+        offset = 0
+        for record_id, length, prediction in zip(batch["ids"], batch["target_lengths"].tolist(), predictions):
+            reference = "".join(VOCAB[index - 1] for index in batch["targets"][offset:offset + length].tolist())
+            offset += length
+            metrics.add(reference, prediction)
+            alignment = alignment_errors(reference, prediction)
+            categories = _error_categories(reference, prediction) if alignment["operations"] else []
+            if alignment["operations"]:
+                category_counts.update(categories)
+                error_counts.update({kind: alignment[kind + "s"] for kind in ("insertion", "deletion", "substitution")})
+            records.append({
+                "id": record_id,
+                "reference": reference,
+                "prediction": prediction,
+                "character_errors": alignment["insertions"] + alignment["deletions"] + alignment["substitutions"],
+                "grammar_validation": validate_tonic_solfa(prediction).to_dict(),
+                "error_operations": alignment["operations"],
+                "error_categories": categories,
+            })
+    summary = {
+        **metrics.to_dict(),
+        "error_operations": dict(error_counts),
+        "error_categories": {
+            category: category_counts[category]
+            for category in (
+                "octave_marker", "rhythmic_symbol", "chromatic_note", "repeated_character",
+                "multiple_note_cell", "blank_cell", "visual_beat_separator",
+            )
+        },
+        "incorrect_samples": sum(record["comparison_available"] and record["character_errors"] > 0 for record in records),
+        "correct_samples": sum(record["comparison_available"] and record["character_errors"] == 0 for record in records),
+    }
+    return records, summary
+
+
+def full_validation_diagnostics(
+    project_root: Path, checkpoint_path: Path, *, device_name: str = "auto"
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    return full_split_diagnostics(project_root, checkpoint_path, split_name="val", device_name=device_name)
+
+
+def full_test_diagnostics(
+    project_root: Path, checkpoint_path: Path, *, device_name: str = "auto"
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    return full_split_diagnostics(project_root, checkpoint_path, split_name="test", device_name=device_name)
+
+
+def verify_test_split_integrity(project_root: Path, evaluated_ids: set[str]) -> dict[str, Any]:
+    """Prove that the evaluated IDs are exactly test-only and duplicate-safe."""
+    splits = {name: load_manifest(project_root / f"data/processed/{name}.json") for name in ("train", "val", "test")}
+    ids = {name: {record.id for record in records} for name, records in splits.items()}
+    test_hashes = {record.image_sha256 for record in splits["test"] if record.image_sha256}
+    test_groups = {f"{record.source_dataset}:{record.source_group}" for record in splits["test"] if record.source_group}
+    other_hashes = {
+        name: {record.image_sha256 for record in records if record.image_sha256}
+        for name, records in splits.items() if name != "test"
+    }
+    other_groups = {
+        name: {f"{record.source_dataset}:{record.source_group}" for record in records if record.source_group}
+        for name, records in splits.items() if name != "test"
+    }
+    report = {
+        "expected_test_samples": len(splits["test"]),
+        "distinct_test_ids": len(ids["test"]),
+        "evaluated_samples": len(evaluated_ids),
+        "evaluated_ids_match_test": evaluated_ids == ids["test"],
+        "id_overlap": {name: sorted(ids["test"] & ids[name]) for name in ("train", "val")},
+        "shared_exact_image_hashes": {name: sorted(test_hashes & other_hashes[name]) for name in ("train", "val")},
+        "shared_source_groups": {name: sorted(test_groups & other_groups[name]) for name in ("train", "val")},
+    }
+    if not report["evaluated_ids_match_test"] or any(report["id_overlap"].values()) or any(report["shared_exact_image_hashes"].values()) or any(report["shared_source_groups"].values()):
+        raise RuntimeError("Held-out test split integrity check failed")
+    return report
+
+
+@torch.no_grad()
+def evaluate_external_labeled_dataset(
+    dataset_root: Path,
+    checkpoint_path: Path,
+    *,
+    device_name: str = "auto",
+    batch_size: int = 8,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Read-only inference for a separately supplied labels.json dataset.
+
+    This deliberately does not route through dataset validation, admission, or
+    split logic. Labels are compared exactly as supplied in ``finalLabel``.
+    """
+    payload = json.loads((dataset_root / "labels.json").read_text(encoding="utf-8"))
+    rows = payload["labels"]
+    device = training_device(device_name)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    model = TonicSolfaCRNN(CRNNConfig(**checkpoint["model_config"])).to(device)
+    load_checkpoint(checkpoint_path, model, device=device)
+    model.eval()
+    metrics = RecognitionMetrics()
+    category_counts: Counter[str] = Counter()
+    error_counts: Counter[str] = Counter()
+    unscored_ids: list[str] = []
+    records: list[dict[str, Any]] = []
+    for start in range(0, len(rows), batch_size):
+        batch_rows = rows[start:start + batch_size]
+        images_and_widths = [preprocess_image(dataset_root / row["image"], PreprocessConfig(), training=False) for row in batch_rows]
+        images = pad_image_tensors([image for image, _ in images_and_widths]).to(device)
+        widths = torch.tensor([width for _, width in images_and_widths], dtype=torch.long, device=device)
+        logits = model(images)
+        predictions = greedy_decode(logits, model.output_lengths(widths))
+        for row, prediction in zip(batch_rows, predictions):
+            reference = row["finalLabel"]
+            if reference is None:
+                unscored_ids.append(row.get("id", ""))
+                records.append({
+                    "id": row.get("id"), "image": row["image"], "reference": None, "prediction": prediction,
+                    "comparison_available": False, "character_errors": None,
+                    "grammar_validation": validate_tonic_solfa(prediction).to_dict(),
+                    "error_operations": [], "error_categories": [],
+                })
+                continue
+            metrics.add(reference, prediction)
+            alignment = alignment_errors(reference, prediction)
+            categories = _error_categories(reference, prediction) if alignment["operations"] else []
+            if alignment["operations"]:
+                category_counts.update(categories)
+                error_counts.update({kind: alignment[kind + "s"] for kind in ("insertion", "deletion", "substitution")})
+            records.append({
+                "id": row.get("id"), "image": row["image"], "reference": reference, "prediction": prediction,
+                "comparison_available": True,
+                "character_errors": alignment["insertions"] + alignment["deletions"] + alignment["substitutions"],
+                "grammar_validation": validate_tonic_solfa(prediction).to_dict(),
+                "error_operations": alignment["operations"], "error_categories": categories,
+            })
+    summary = {
+        **metrics.to_dict(),
+        "error_operations": dict(error_counts),
+        "error_categories": {
+            category: category_counts[category]
+            for category in ("octave_marker", "rhythmic_symbol", "chromatic_note", "repeated_character", "multiple_note_cell", "blank_cell", "visual_beat_separator")
+        },
+        "incorrect_samples": sum(record["comparison_available"] and record["character_errors"] > 0 for record in records),
+        "correct_samples": sum(record["comparison_available"] and record["character_errors"] == 0 for record in records),
+        "total_images": len(records),
+        "scored_samples": metrics.samples,
+        "unscored_null_label_samples": len(unscored_ids),
+        "unscored_null_label_ids": unscored_ids,
+    }
+    return records, summary

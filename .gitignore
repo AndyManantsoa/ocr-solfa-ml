@@ -12,6 +12,7 @@ dist/
 data/solfanote_dataset_labeled/
 data/solfanote-training/
 data/processed/
+data/new labeled data
 
 # Generated ML artifacts.
 checkpoints/*

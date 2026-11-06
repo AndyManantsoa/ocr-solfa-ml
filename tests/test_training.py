@@ -1,11 +1,13 @@
 """Training infrastructure checks using synthetic CTC batches only."""
 
 from pathlib import Path
+import json
 
 import pytest
 import torch
 from torch.optim import AdamW
 
+from sn_ml.evaluate import alignment_errors, recognition_metrics
 from sn_ml.model import TonicSolfaCRNN, ctc_loss
 from sn_ml.train import (
     TrainingConfig,
@@ -16,6 +18,7 @@ from sn_ml.train import (
     validate_epoch,
     run_training,
     verify_real_training_step,
+    verify_test_split_integrity,
 )
 
 
@@ -94,3 +97,26 @@ def test_real_mps_training_step_when_available() -> None:
     assert result["device"] == "mps"
     assert result["parameters_updated"] is True
     assert result["finite_gradients"] is True
+
+
+def test_diagnostic_alignment_and_aggregate_metrics_are_exact() -> None:
+    assert alignment_errors("dr", "d")["deletions"] == 1
+    assert alignment_errors("d", "di")["insertions"] == 1
+    assert alignment_errors("d", "r")["substitutions"] == 1
+    metrics = recognition_metrics([("dr", "d"), ("d", "d")])
+    assert metrics["samples"] == 2
+    assert metrics["character_errors"] == 1
+    assert metrics["reference_characters"] == 3
+    assert metrics["cer"] == pytest.approx(1 / 3)
+    assert metrics["exact_cell_accuracy"] == pytest.approx(0.5)
+
+
+def test_held_out_test_manifest_has_exact_id_and_duplicate_group_separation() -> None:
+    root = Path(__file__).resolve().parents[1]
+    test_ids = {record["id"] for record in json.loads((root / "data/processed/test.json").read_text())["records"]}
+    report = verify_test_split_integrity(root, test_ids)
+    assert report["expected_test_samples"] == 301
+    assert report["evaluated_ids_match_test"] is True
+    assert all(not overlap for overlap in report["id_overlap"].values())
+    assert all(not overlap for overlap in report["shared_exact_image_hashes"].values())
+    assert all(not overlap for overlap in report["shared_source_groups"].values())

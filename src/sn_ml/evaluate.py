@@ -85,3 +85,37 @@ def character_error_summary(reference: str, prediction: str) -> dict[str, object
         "character_errors": levenshtein_distance(reference, prediction),
         "prediction_grammar": validate_tonic_solfa(prediction).to_dict(),
     }
+
+
+def alignment_errors(reference: str, prediction: str) -> dict[str, object]:
+    """Return deterministic Levenshtein operations without changing either string."""
+    rows, columns = len(reference), len(prediction)
+    costs = [[0] * (columns + 1) for _ in range(rows + 1)]
+    for row in range(rows + 1):
+        costs[row][0] = row
+    for column in range(columns + 1):
+        costs[0][column] = column
+    for row in range(1, rows + 1):
+        for column in range(1, columns + 1):
+            costs[row][column] = min(
+                costs[row - 1][column] + 1,
+                costs[row][column - 1] + 1,
+                costs[row - 1][column - 1] + (reference[row - 1] != prediction[column - 1]),
+            )
+    operations: list[dict[str, object]] = []
+    row, column = rows, columns
+    while row or column:
+        if row and column and costs[row][column] == costs[row - 1][column - 1] and reference[row - 1] == prediction[column - 1]:
+            row, column = row - 1, column - 1
+        elif row and column and costs[row][column] == costs[row - 1][column - 1] + 1:
+            operations.append({"kind": "substitution", "reference": reference[row - 1], "prediction": prediction[column - 1]})
+            row, column = row - 1, column - 1
+        elif column and costs[row][column] == costs[row][column - 1] + 1:
+            operations.append({"kind": "insertion", "reference": "", "prediction": prediction[column - 1]})
+            column -= 1
+        else:
+            operations.append({"kind": "deletion", "reference": reference[row - 1], "prediction": ""})
+            row -= 1
+    operations.reverse()
+    counts = Counter(operation["kind"] for operation in operations)
+    return {"operations": operations, "insertions": counts["insertion"], "deletions": counts["deletion"], "substitutions": counts["substitution"]}
