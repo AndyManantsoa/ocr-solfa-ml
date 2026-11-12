@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the bounded Phase 5A CRNN/CTC smoke experiment; never evaluates test.json."""
+"""Run a bounded Phase 3 CRNN/CTC smoke experiment; never reads test data."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ def main() -> None:
     parser.add_argument("--train-limit", type=int, default=32)
     parser.add_argument("--validation-limit", type=int, default=16)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--resume", type=Path, help="Resume from a latest checkpoint within the same experiment.")
     args = parser.parse_args()
     result = run_training(

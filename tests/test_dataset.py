@@ -18,7 +18,7 @@ from sn_ml.dataset import (
     make_splits,
     normalize_label_spacing,
     validate_records,
-    write_processed_outputs,
+    make_train_validation_split,
 )
 
 
@@ -149,11 +149,10 @@ def test_source_grouping_reports_only_exported_identifiers(tmp_path: Path) -> No
     assert report["datasets"]["training"]["confidence"] == "partial"
 
 
-def test_preparation_preserves_source_labels_file(tmp_path: Path) -> None:
+def test_grouped_train_validation_split_is_reproducible(tmp_path: Path) -> None:
     _sources(tmp_path)
-    source = tmp_path / "data/training/labels.json"
-    before = hashlib.sha256(source.read_bytes()).hexdigest()
-    write_processed_outputs(tmp_path, seed=9)
-    assert hashlib.sha256(source.read_bytes()).hexdigest() == before
-    assert (tmp_path / "data/processed/unified.json").is_file()
-    assert (tmp_path / "data/processed/reports/dataset_report.json").is_file()
+    records = load_unified_records(tmp_path)
+    validate_records(records, tmp_path)
+    first = make_train_validation_split(records, seed=9)
+    second = make_train_validation_split(records, seed=9)
+    assert {name: [record.id for record in split] for name, split in first.items()} == {name: [record.id for record in split] for name, split in second.items()}

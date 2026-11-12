@@ -33,14 +33,16 @@ class TrainingConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     gradient_clip_norm: float = 1.0
-    epochs: int = 2
+    epochs: int = 3
     patience: int = 3
     scheduler_patience: int = 3
     scheduler_factor: float = 0.5
     num_workers: int = 0
     device: str = "auto"
-    checkpoint_dir: str = "checkpoints/phase5a_smoke"
-    metrics_path: str = "exports/phase5a_smoke_metrics.json"
+    checkpoint_dir: str = "checkpoints/phase3_smoke"
+    metrics_path: str = "exports/phase3_smoke_metrics.json"
+    train_manifest: str = "manifests/phase3_train.json"
+    validation_manifest: str = "manifests/phase3_val.json"
 
 
 def set_reproducible_seed(seed: int) -> None:
@@ -180,8 +182,8 @@ def run_training(
     set_reproducible_seed(config.seed)
     device = training_device(config.device)
     preprocess = PreprocessConfig()
-    train_loader = _manifest_loader(project_root / "data/processed/train.json", project_root, preprocess, config, training=True, limit=train_limit)
-    validation_loader = _manifest_loader(project_root / "data/processed/val.json", project_root, preprocess, config, training=False, limit=validation_limit)
+    train_loader = _manifest_loader(project_root / config.train_manifest, project_root, preprocess, config, training=True, limit=train_limit)
+    validation_loader = _manifest_loader(project_root / config.validation_manifest, project_root, preprocess, config, training=False, limit=validation_limit)
     model = TonicSolfaCRNN(CRNNConfig()).to(device)
     optimizer = AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=config.scheduler_factor, patience=config.scheduler_patience)
@@ -233,7 +235,7 @@ def run_training(
         "train_samples": len(train_loader.dataset), "validation_samples": len(validation_loader.dataset),
         "history": history, "best_checkpoint": _display_path(best_path, project_root),
         "latest_checkpoint": _display_path(latest_path, project_root),
-        "grammar_review_targets": sum(not validate_tonic_solfa(record.normalized_label or "").valid for record in load_manifest(project_root / "data/processed/train.json")),
+        "grammar_review_targets": sum(not validate_tonic_solfa(record.normalized_label or "").valid for record in load_manifest(project_root / config.train_manifest)),
     }
     metrics_path = project_root / config.metrics_path
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -246,7 +248,7 @@ def verify_real_training_step(project_root: Path, device_name: str = "mps") -> d
     device = training_device(device_name)
     config = TrainingConfig(batch_size=8, device=device_name)
     loader = _manifest_loader(
-        project_root / "data/processed/train.json", project_root, PreprocessConfig(), config,
+        project_root / config.train_manifest, project_root, PreprocessConfig(), config,
         training=False, limit=config.batch_size,
     )
     batch = next(iter(loader))
@@ -273,7 +275,7 @@ def validation_diagnostics(
     device = training_device(device_name)
     config = TrainingConfig(batch_size=8, device=device_name)
     loader = _manifest_loader(
-        project_root / "data/processed/val.json", project_root, PreprocessConfig(), config,
+        project_root / config.validation_manifest, project_root, PreprocessConfig(), config,
         training=False, limit=limit,
     )
     model = TonicSolfaCRNN(CRNNConfig()).to(device)
@@ -322,14 +324,14 @@ def full_split_diagnostics(
     device_name: str = "auto",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Evaluate every record in one existing manifest without changing it."""
-    if split_name not in {"val", "test"}:
-        raise ValueError("Full diagnostics supports only the fixed val or test manifest")
+    if split_name != "val":
+        raise ValueError("Training diagnostics supports only the Phase 3 validation manifest")
     device = training_device(device_name)
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model = TonicSolfaCRNN(CRNNConfig(**checkpoint["model_config"])).to(device)
     load_checkpoint(checkpoint_path, model, device=device)
     loader = _manifest_loader(
-        project_root / f"data/processed/{split_name}.json", project_root, PreprocessConfig(),
+        project_root / "manifests/phase3_val.json", project_root, PreprocessConfig(),
         TrainingConfig(batch_size=8, device=device_name), training=False, limit=None,
     )
     model.eval()
@@ -370,8 +372,8 @@ def full_split_diagnostics(
                 "multiple_note_cell", "blank_cell", "visual_beat_separator",
             )
         },
-        "incorrect_samples": sum(record["comparison_available"] and record["character_errors"] > 0 for record in records),
-        "correct_samples": sum(record["comparison_available"] and record["character_errors"] == 0 for record in records),
+        "incorrect_samples": sum(record["character_errors"] > 0 for record in records),
+        "correct_samples": sum(record["character_errors"] == 0 for record in records),
     }
     return records, summary
 
@@ -380,40 +382,6 @@ def full_validation_diagnostics(
     project_root: Path, checkpoint_path: Path, *, device_name: str = "auto"
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     return full_split_diagnostics(project_root, checkpoint_path, split_name="val", device_name=device_name)
-
-
-def full_test_diagnostics(
-    project_root: Path, checkpoint_path: Path, *, device_name: str = "auto"
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    return full_split_diagnostics(project_root, checkpoint_path, split_name="test", device_name=device_name)
-
-
-def verify_test_split_integrity(project_root: Path, evaluated_ids: set[str]) -> dict[str, Any]:
-    """Prove that the evaluated IDs are exactly test-only and duplicate-safe."""
-    splits = {name: load_manifest(project_root / f"data/processed/{name}.json") for name in ("train", "val", "test")}
-    ids = {name: {record.id for record in records} for name, records in splits.items()}
-    test_hashes = {record.image_sha256 for record in splits["test"] if record.image_sha256}
-    test_groups = {f"{record.source_dataset}:{record.source_group}" for record in splits["test"] if record.source_group}
-    other_hashes = {
-        name: {record.image_sha256 for record in records if record.image_sha256}
-        for name, records in splits.items() if name != "test"
-    }
-    other_groups = {
-        name: {f"{record.source_dataset}:{record.source_group}" for record in records if record.source_group}
-        for name, records in splits.items() if name != "test"
-    }
-    report = {
-        "expected_test_samples": len(splits["test"]),
-        "distinct_test_ids": len(ids["test"]),
-        "evaluated_samples": len(evaluated_ids),
-        "evaluated_ids_match_test": evaluated_ids == ids["test"],
-        "id_overlap": {name: sorted(ids["test"] & ids[name]) for name in ("train", "val")},
-        "shared_exact_image_hashes": {name: sorted(test_hashes & other_hashes[name]) for name in ("train", "val")},
-        "shared_source_groups": {name: sorted(test_groups & other_groups[name]) for name in ("train", "val")},
-    }
-    if not report["evaluated_ids_match_test"] or any(report["id_overlap"].values()) or any(report["shared_exact_image_hashes"].values()) or any(report["shared_source_groups"].values()):
-        raise RuntimeError("Held-out test split integrity check failed")
-    return report
 
 
 @torch.no_grad()

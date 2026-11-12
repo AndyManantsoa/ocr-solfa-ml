@@ -54,7 +54,7 @@ def test_greedy_batch_decode_obeys_lengths() -> None:
 
 def test_real_manifest_images_batch_and_forward() -> None:
     root = Path(__file__).resolve().parents[1]
-    records = load_manifest(root / "data/processed/train.json")
+    records = load_manifest(root / "manifests/phase3_train.json")
     dataset = OcrManifestDataset(records[:2], root, PreprocessConfig(image_height=64))
     batch = collate_ocr_batch([dataset[0], dataset[1]])
     model = TonicSolfaCRNN()

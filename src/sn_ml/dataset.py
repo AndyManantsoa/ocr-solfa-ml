@@ -125,27 +125,12 @@ def _read_entries(source: DatasetSource) -> list[Mapping[str, Any]]:
     return entries
 
 
-def _provenance(source_name: str, row: Mapping[str, Any]) -> str | None:
-    value = row.get("labelSource") if source_name == "solfanote-training" else row.get("transcriptionMethod")
-    return value if isinstance(value, str) else None
-
-
 def _annotation_quality(source_name: str, row: Mapping[str, Any], label: str | None) -> str:
     """Classify provenance without claiming independent verification where absent."""
     if label is None:
         return "invalid_or_unresolved"
     if source_name == "training":
         return "consolidated_approved"
-    if source_name == "solfanote-training":
-        if row.get("labelSource") == "manual-correction":
-            return "manually_corrected"
-        if row.get("labelSource") == "ocr-reviewed":
-            return "ocr_reviewed"
-        if row.get("originalReviewState") == "recognized":
-            return "automatically_accepted"
-        return "unverified"
-    if row.get("transcriptionMethod") in {"direct_visual_transcription", "visual_group_transcription"}:
-        return "visually_transcribed"
     return "unverified"
 
 
@@ -515,6 +500,50 @@ def make_splits(
     return {name: [record for group in assigned[name] for record in group] for name in SPLIT_NAMES}
 
 
+def make_train_validation_split(records: list[UnifiedRecord], seed: int = 1337) -> dict[str, list[UnifiedRecord]]:
+    """Deterministically assign hash/source groups to an 85/15 train/validation split."""
+    candidates = [record for record in records if record.trusted]
+    groups = _connected_groups(candidates)
+    rng = random.Random(seed)
+    rng.shuffle(groups)
+    groups.sort(key=len, reverse=True)
+    target_validation = len(candidates) * 0.15
+    assigned: dict[str, list[list[UnifiedRecord]]] = {"train": [], "val": []}
+    counts: Counter[str] = Counter()
+    for group in groups:
+        choices = []
+        for name in ("train", "val"):
+            target = target_validation if name == "val" else len(candidates) - target_validation
+            before = ((counts[name] - target) / max(target, 1)) ** 2
+            after = ((counts[name] + len(group) - target) / max(target, 1)) ** 2
+            choices.append((after - before, counts[name], name))
+        destination = min(choices)[2]
+        assigned[destination].append(group)
+        counts[destination] += len(group)
+    return {name: [record for group in assigned[name] for record in group] for name in ("train", "val")}
+
+
+def write_phase3_train_validation_manifests(project_root: Path, seed: int = 1337) -> dict[str, int]:
+    """Create only Phase 3 train/validation manifests; never reads test data."""
+    records = load_unified_records(project_root)
+    validate_records(records, project_root)
+    splits = make_train_validation_split(records, seed=seed)
+    train_hashes = {record.image_sha256 for record in splits["train"]}
+    validation_hashes = {record.image_sha256 for record in splits["val"]}
+    train_groups = {record.source_group for record in splits["train"] if record.source_group}
+    validation_groups = {record.source_group for record in splits["val"] if record.source_group}
+    if train_hashes & validation_hashes or train_groups & validation_groups:
+        raise RuntimeError("Phase 3 train/validation split leaks image hashes or source groups")
+    manifests = project_root / "manifests"
+    manifests.mkdir(exist_ok=True)
+    for name, split_records in splits.items():
+        (manifests / f"phase3_{name}.json").write_text(
+            json.dumps({"schema_version": 1, "seed": seed, "records": [record.to_dict() for record in split_records]}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    return {"train": len(splits["train"]), "val": len(splits["val"])}
+
+
 def _shared_values(value_lists: Iterable[Iterable[str]]) -> list[str]:
     appearances: Counter[str] = Counter()
     for values in value_lists:
@@ -573,7 +602,7 @@ def build_review_manifest(records: list[UnifiedRecord], seed: int = 1337, per_st
     """Select reproducible, unpromoted review examples from the new export."""
     candidates = [
         record for record in records
-        if record.source_dataset == "solfanote_dataset_labeled"
+        if record.source_dataset == "training"
         and record.normalized_label is not None
         and not any(issue in record.issues for issue in ("missing_image", "unreadable_image", "invalid_image_path", "unsupported_characters", "ambiguous_whitespace"))
     ]
@@ -611,69 +640,6 @@ def build_review_manifest(records: list[UnifiedRecord], seed: int = 1337, per_st
             for record in sorted(selected.values(), key=lambda record: record.id)
         ],
     }
-
-
-def _existing_test_ids(path: Path, seed: int) -> set[str]:
-    """Keep previously generated reviewed test records independent after refinement."""
-    if not path.is_file():
-        return set()
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return set()
-    if not isinstance(payload, dict) or payload.get("seed") != seed or not isinstance(payload.get("records"), list):
-        return set()
-    return {record.get("id") for record in payload["records"] if isinstance(record, dict) and isinstance(record.get("id"), str)}
-
-
-def write_processed_outputs(
-    project_root: Path,
-    seed: int = 1337,
-    policy: AdmissionPolicy = REVIEWED_ONLY_POLICY,
-) -> dict[str, Any]:
-    """Write derived artifacts under ``data/processed``; original datasets stay read-only.
-
-    A pre-consolidation test manifest is a frozen historical evaluation asset.
-    It must not be silently replaced by a split of ``data/training``.
-    """
-    existing_test_path = project_root / "data/processed/test.json"
-    if existing_test_path.is_file():
-        existing_test = load_manifest(existing_test_path)
-        if any(record.source_root != "data/training" for record in existing_test):
-            raise RuntimeError(
-                "Refusing to overwrite the frozen legacy test manifest. "
-                "Create a dedicated train/validation split from data/training instead."
-            )
-    records = load_unified_records(project_root)
-    validate_records(records, project_root, policy=policy)
-    report = build_report(records)
-    output_root = project_root / "data/processed"
-    reports_root = output_root / "reports"
-    reports_root.mkdir(parents=True, exist_ok=True)
-    prior_test_ids = _existing_test_ids(output_root / "test.json", seed)
-    splits = make_splits(records, seed=seed, locked_test_ids=prior_test_ids)
-    def write_json(path: Path, payload: Any) -> None:
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    write_json(output_root / "unified.json", {"schema_version": 1, "records": [record.to_dict() for record in records]})
-    for name, split_records in splits.items():
-        write_json(output_root / f"{name}.json", {"schema_version": 1, "seed": seed, "records": [record.to_dict() for record in split_records]})
-    report["splits"] = {
-        "seed": seed,
-        "admission_policy": policy.name,
-        "counts": {name: len(split_records) for name, split_records in splits.items()},
-        "source_groups": {name: len(_connected_groups(split_records)) for name, split_records in splits.items()},
-        "leakage_checks": {
-            "shared_image_hashes": _shared_values([[record.image_sha256 for record in split_records if record.image_sha256] for split_records in splits.values()]),
-            "shared_source_groups": _shared_values([[f"{record.source_dataset}:{record.source_group}" for record in split_records if record.source_group] for split_records in splits.values()]),
-        },
-        "preserved_prior_test_ids": len(prior_test_ids),
-        "preserved_prior_test_ids_present": len(prior_test_ids & {record.id for record in splits["test"]}),
-    }
-    write_json(reports_root / "dataset_report.json", report)
-    write_json(reports_root / "issues.json", {"issue_counts": report["issue_counts"], "examples": report["issue_examples"]})
-    write_json(reports_root / "source_grouping_report.json", build_source_grouping_report(records))
-    write_json(reports_root / "review_manifest.json", build_review_manifest(records, seed=seed))
-    return report
 
 
 def load_manifest(path: Path) -> list[UnifiedRecord]:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MPS-only Phase 5B training. This command never reads the held-out test split."""
+"""MPS-only Phase 3 training. This command never reads data/test-data."""
 
 from __future__ import annotations
 
@@ -24,16 +24,16 @@ def main() -> None:
     result = run_training(
         root,
         TrainingConfig(
-            device="mps", batch_size=8, learning_rate=1e-3, epochs=50, patience=7,
-            gradient_clip_norm=1.0, checkpoint_dir="checkpoints/phase5b_mps",
-            metrics_path="exports/phase5b_mps_metrics.json",
+            device="mps", batch_size=4, learning_rate=1e-3, epochs=50, patience=7,
+            gradient_clip_norm=1.0, checkpoint_dir="checkpoints/phase3_mps",
+            metrics_path="exports/phase3_mps_metrics.json",
         ),
         resume_path=args.resume,
         verbose=True,
     )
     best = min(result["history"], key=lambda row: (row["validation"]["cer"], -row["validation"]["exact_cell_accuracy"]))
     diagnostics = validation_diagnostics(root, root / result["best_checkpoint"], device_name="mps")
-    diagnostics_path = root / "exports/phase5b_validation_diagnostics.json"
+    diagnostics_path = root / "exports/phase3_validation_diagnostics.json"
     diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
     diagnostics_path.write_text(json.dumps(diagnostics, indent=2) + "\n", encoding="utf-8")
     print(f"finished epochs={len(result['history'])} best_epoch={best['epoch']} best_cer={best['validation']['cer']:.4f}")
