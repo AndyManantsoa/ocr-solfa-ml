@@ -37,7 +37,7 @@ class AdmissionPolicy:
 
 REVIEWED_ONLY_POLICY = AdmissionPolicy(
     name="reviewed-only",
-    admitted_categories=frozenset({"manually_corrected", "ocr_reviewed"}),
+    admitted_categories=frozenset({"manually_corrected", "ocr_reviewed", "consolidated_approved"}),
 )
 MANUAL_ONLY_POLICY = AdmissionPolicy(
     name="manual-corrections-only",
@@ -46,7 +46,7 @@ MANUAL_ONLY_POLICY = AdmissionPolicy(
 ADMISSION_POLICIES = {policy.name: policy for policy in (REVIEWED_ONLY_POLICY, MANUAL_ONLY_POLICY)}
 QUALITY_CATEGORIES = (
     "manually_corrected", "ocr_reviewed", "visually_transcribed", "automatically_accepted",
-    "unverified", "invalid_or_unresolved",
+    "consolidated_approved", "unverified", "invalid_or_unresolved",
 )
 
 
@@ -107,9 +107,9 @@ class _UnionFind:
 
 
 def project_sources(project_root: Path) -> tuple[DatasetSource, ...]:
+    """The canonical training source; test data is never a training source."""
     return (
-        DatasetSource("solfanote_dataset_labeled", project_root / "data/solfanote_dataset_labeled"),
-        DatasetSource("solfanote-training", project_root / "data/solfanote-training"),
+        DatasetSource("training", project_root / "data/training"),
     )
 
 
@@ -134,6 +134,8 @@ def _annotation_quality(source_name: str, row: Mapping[str, Any], label: str | N
     """Classify provenance without claiming independent verification where absent."""
     if label is None:
         return "invalid_or_unresolved"
+    if source_name == "training":
+        return "consolidated_approved"
     if source_name == "solfanote-training":
         if row.get("labelSource") == "manual-correction":
             return "manually_corrected"
@@ -171,20 +173,43 @@ def normalize_label_spacing(label: str | None) -> tuple[str | None, str]:
 
 
 def load_unified_records(project_root: Path) -> list[UnifiedRecord]:
-    """Load both exports using ``finalLabel`` only; source data are never written."""
+    """Load only the canonical consolidated training export and its sidecar."""
     records: list[UnifiedRecord] = []
     seen_ids: set[str] = set()
     for source in project_sources(project_root):
         source_root = source.root.relative_to(project_root).as_posix()
-        for row_index, row in enumerate(_read_entries(source)):
-            source_id = row.get("id")
+        rows = _read_entries(source)
+        sidecar_path = project_root / "manifests/training_consolidation_v1.json"
+        try:
+            sidecar_payload = json.loads(sidecar_path.read_text(encoding="utf-8"))
+            sidecar_records = sidecar_payload["records"]
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+            raise DatasetFormatError(f"Cannot read training consolidation sidecar {sidecar_path}: {error}") from error
+        if not isinstance(sidecar_records, list):
+            raise DatasetFormatError(f"{sidecar_path} must contain a records list")
+        metadata_by_image = {
+            item.get("image"): item for item in sidecar_records
+            if isinstance(item, dict) and isinstance(item.get("image"), str)
+        }
+        if len(metadata_by_image) != len(rows) or {row.get("image") for row in rows if isinstance(row, dict)} != set(metadata_by_image):
+            raise DatasetFormatError("Canonical training labels and consolidation sidecar do not have a one-to-one image mapping")
+        for row_index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                raise DatasetFormatError(f"{source.root / 'labels.json'} contains a non-object label row")
             image = row.get("image")
-            label = row.get("finalLabel")
+            metadata = metadata_by_image.get(image)
+            if metadata is None:
+                raise DatasetFormatError(f"No consolidation metadata for training image {image!r}")
+            source_id = metadata.get("canonical_id")
+            label = row.get("label")
             if not isinstance(source_id, str) or not source_id:
                 source_id = f"invalid-{row_index:06d}"
             record_id = source_id if source_id not in seen_ids else f"{source.name}:{source_id}"
             seen_ids.add(record_id)
-            source_group = row.get("lineId") if isinstance(row.get("lineId"), str) else None
+            group = metadata.get("source_group")
+            group_kind = group.get("kind") if isinstance(group, dict) and isinstance(group.get("kind"), str) else "none"
+            group_id = group.get("id") if isinstance(group, dict) and isinstance(group.get("id"), str) else None
+            source_group = f"{group_kind}:{group_id}" if group_id else None
             normalized_label, normalization_status = normalize_label_spacing(label if label is None or isinstance(label, str) else None)
             records.append(UnifiedRecord(
                 id=record_id,
@@ -194,12 +219,12 @@ def load_unified_records(project_root: Path) -> list[UnifiedRecord]:
                 source_root=source_root,
                 source_id=source_id,
                 source_group=source_group,
-                provenance=_provenance(source.name, row),
+                provenance="consolidation_sidecar",
                 normalized_label=normalized_label,
                 normalization_status=normalization_status,
                 annotation_quality=_annotation_quality(source.name, row, label if label is None or isinstance(label, str) else None),
-                grouping_kind="line_id" if source_group else "none",
-                grouping_confidence="partial" if source_group else "none",
+                grouping_kind=group_kind,
+                grouping_confidence="sidecar" if source_group else "none",
             ))
     return records
 
@@ -606,7 +631,19 @@ def write_processed_outputs(
     seed: int = 1337,
     policy: AdmissionPolicy = REVIEWED_ONLY_POLICY,
 ) -> dict[str, Any]:
-    """Write derived artifacts under ``data/processed``; original datasets stay read-only."""
+    """Write derived artifacts under ``data/processed``; original datasets stay read-only.
+
+    A pre-consolidation test manifest is a frozen historical evaluation asset.
+    It must not be silently replaced by a split of ``data/training``.
+    """
+    existing_test_path = project_root / "data/processed/test.json"
+    if existing_test_path.is_file():
+        existing_test = load_manifest(existing_test_path)
+        if any(record.source_root != "data/training" for record in existing_test):
+            raise RuntimeError(
+                "Refusing to overwrite the frozen legacy test manifest. "
+                "Create a dedicated train/validation split from data/training instead."
+            )
     records = load_unified_records(project_root)
     validate_records(records, project_root, policy=policy)
     report = build_report(records)

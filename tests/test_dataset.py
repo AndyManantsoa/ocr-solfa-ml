@@ -27,32 +27,34 @@ def _write_png(path: Path, color: int = 255) -> None:
     Image.new("L", (24, 12), color=color).save(path)
 
 
-def _write_export(root: Path, name: str, rows: list[dict]) -> None:
-    export = root / "data" / name
-    (export / "images").mkdir(parents=True, exist_ok=True)
-    (export / "labels.json").write_text(json.dumps({"version": 1, "labels": rows}), encoding="utf-8")
-
-
 def _sources(tmp_path: Path) -> None:
-    _write_export(tmp_path, "solfanote_dataset_labeled", [
-        {"id": "sample_00001", "image": "images/a.png", "finalLabel": "d", "reviewStatus": "labeled", "transcriptionMethod": "direct_visual_transcription"},
-    ])
-    _write_export(tmp_path, "solfanote-training", [
-        {"id": "train-1", "lineId": "line-a", "image": "images/b.png", "rawOcr": "x", "normalizedOcr": "x", "finalLabel": "d.r", "labelSource": "manual-correction"},
-        {"id": "train-2", "lineId": "line-a", "image": "images/c.png", "finalLabel": "", "labelSource": "ocr-reviewed"},
-    ])
-    _write_png(tmp_path / "data/solfanote_dataset_labeled/images/a.png", color=128)
-    _write_png(tmp_path / "data/solfanote-training/images/b.png")
-    _write_png(tmp_path / "data/solfanote-training/images/c.png", color=0)
+    training = tmp_path / "data/training"
+    (training / "images").mkdir(parents=True, exist_ok=True)
+    labels = [
+        {"image": "images/a.png", "label": "d"},
+        {"image": "images/b.png", "label": "d.r"},
+        {"image": "images/c.png", "label": ""},
+    ]
+    (training / "labels.json").write_text(json.dumps({"labels": labels}), encoding="utf-8")
+    sidecar = {"records": [
+        {"canonical_id": "training-00001", "image": "images/a.png", "source_group": None},
+        {"canonical_id": "training-00002", "image": "images/b.png", "source_group": {"kind": "line_id", "id": "line-a"}},
+        {"canonical_id": "training-00003", "image": "images/c.png", "source_group": {"kind": "line_id", "id": "line-a"}},
+    ]}
+    (tmp_path / "manifests").mkdir()
+    (tmp_path / "manifests/training_consolidation_v1.json").write_text(json.dumps(sidecar), encoding="utf-8")
+    _write_png(training / "images/a.png", color=128)
+    _write_png(training / "images/b.png")
+    _write_png(training / "images/c.png", color=0)
 
 
-def test_loads_both_formats_and_uses_final_label(tmp_path: Path) -> None:
+def test_loads_canonical_training_labels_with_sidecar(tmp_path: Path) -> None:
     _sources(tmp_path)
     records = load_unified_records(tmp_path)
     assert [record.label for record in records] == ["d", "d.r", ""]
     assert records[1].image_path(tmp_path).is_file()
-    assert records[1].source_group == "line-a"
-    assert records[1].id == "train-1"
+    assert records[1].source_group == "line_id:line-a"
+    assert records[1].id == "training-00002"
 
 
 def test_validation_normalizes_formatting_spaces_without_rewriting_original_label(tmp_path: Path) -> None:
@@ -77,23 +79,23 @@ def test_space_normalization_handles_chromatics_octaves_and_punctuation() -> Non
     assert normalize_label_spacing("d\tr") == ("d\tr", "ambiguous_whitespace")
 
 
-def test_annotation_quality_and_policy_are_separate_from_original_labels(tmp_path: Path) -> None:
+def test_consolidated_labels_are_explicitly_admitted_by_default_policy(tmp_path: Path) -> None:
     _sources(tmp_path)
     records = load_unified_records(tmp_path)
     validate_records(records, tmp_path, policy=REVIEWED_ONLY_POLICY)
-    assert records[0].annotation_quality == "visually_transcribed"
-    assert records[0].trusted is False
-    assert records[1].annotation_quality == "manually_corrected"
+    assert records[0].annotation_quality == "consolidated_approved"
+    assert records[0].trusted is True
+    assert records[1].annotation_quality == "consolidated_approved"
     assert records[1].trusted is True
     validate_records(records, tmp_path, policy=MANUAL_ONLY_POLICY)
-    assert records[2].annotation_quality == "ocr_reviewed"
+    assert records[2].annotation_quality == "consolidated_approved"
     assert records[2].trusted is False
 
 
 def test_duplicate_and_conflicting_labels_are_detected(tmp_path: Path) -> None:
     _sources(tmp_path)
-    duplicate = tmp_path / "data/solfanote-training/images/c.png"
-    duplicate.write_bytes((tmp_path / "data/solfanote-training/images/b.png").read_bytes())
+    duplicate = tmp_path / "data/training/images/c.png"
+    duplicate.write_bytes((tmp_path / "data/training/images/b.png").read_bytes())
     records = load_unified_records(tmp_path)
     validate_records(records, tmp_path)
     assert all("exact_duplicate_image" in record.issues for record in records[1:])
@@ -103,9 +105,9 @@ def test_duplicate_and_conflicting_labels_are_detected(tmp_path: Path) -> None:
 
 def _trusted(record_id: str, group: str, image_hash: str) -> UnifiedRecord:
     return UnifiedRecord(
-        id=record_id, image=f"images/{record_id}.png", label="d", source_dataset="solfanote-training",
-        source_root="data/solfanote-training", source_id=record_id, source_group=group,
-        provenance="manual-correction", image_sha256=image_hash, trusted=True,
+        id=record_id, image=f"images/{record_id}.png", label="d", source_dataset="training",
+        source_root="data/training", source_id=record_id, source_group=group,
+        provenance="consolidation_sidecar", image_sha256=image_hash, trusted=True,
     )
 
 
@@ -136,21 +138,20 @@ def test_review_manifest_is_reproducible_and_does_not_promote_samples(tmp_path: 
     second = build_review_manifest(records, seed=3)
     assert first == second
     assert first["purpose"].startswith("manual review")
-    assert records[0].trusted is False
+    assert records[0].trusted is True
 
 
 def test_source_grouping_reports_only_exported_identifiers(tmp_path: Path) -> None:
     _sources(tmp_path)
     records = load_unified_records(tmp_path)
     report = build_source_grouping_report(records)
-    assert report["datasets"]["solfanote-training"]["grouping_kind"] == "line_id"
-    assert report["datasets"]["solfanote-training"]["confidence"] == "partial"
-    assert report["datasets"]["solfanote_dataset_labeled"]["grouping_kind"] == "none"
+    assert report["datasets"]["training"]["grouping_kind"] == "line_id"
+    assert report["datasets"]["training"]["confidence"] == "partial"
 
 
 def test_preparation_preserves_source_labels_file(tmp_path: Path) -> None:
     _sources(tmp_path)
-    source = tmp_path / "data/solfanote-training/labels.json"
+    source = tmp_path / "data/training/labels.json"
     before = hashlib.sha256(source.read_bytes()).hexdigest()
     write_processed_outputs(tmp_path, seed=9)
     assert hashlib.sha256(source.read_bytes()).hexdigest() == before

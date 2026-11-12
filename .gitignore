@@ -9,10 +9,8 @@ build/
 dist/
 
 # Original and generated dataset content is local-only.
-data/solfanote_dataset_labeled/
-data/solfanote-training/
-data/processed/
-data/new labeled data
+data/training
+data/test-data
 
 # Generated ML artifacts.
 checkpoints/*
